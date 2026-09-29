@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS road_corridors (
     hourly_capacity TEXT NOT NULL,
     delay_basis_points INTEGER NOT NULL,
     response_minutes INTEGER NOT NULL,
+    duration_unit TEXT NOT NULL DEFAULT 'minutes'
+        CHECK(duration_unit IN ('minutes','minutes_legacy_unknown')),
+    duration_confirmed_by TEXT,
+    duration_confirmed_at TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
     created_at TEXT NOT NULL,
@@ -142,6 +146,7 @@ CREATE TABLE IF NOT EXISTS deployments (
     deployed_units TEXT NOT NULL,
     expected_arrived_units TEXT NOT NULL,
     departed_at TEXT NOT NULL,
+    expected_arrival_at TEXT,
     arrived_at TEXT,
     state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
     revision INTEGER NOT NULL DEFAULT 1,
@@ -209,6 +214,34 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_legacy_durations(connection)
+
+
+def _migrate_legacy_durations(connection: sqlite3.Connection) -> None:
+    """存量路线没有单位溯源：一律标为分钟语义待人工确认，禁止自动参与调度。"""
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(road_corridors)").fetchall()
+    }
+    if "duration_unit" not in columns:
+        connection.execute(
+            "ALTER TABLE road_corridors ADD COLUMN duration_unit TEXT NOT NULL DEFAULT 'minutes_legacy_unknown'"
+        )
+    if "duration_confirmed_by" not in columns:
+        connection.execute("ALTER TABLE road_corridors ADD COLUMN duration_confirmed_by TEXT")
+    if "duration_confirmed_at" not in columns:
+        connection.execute("ALTER TABLE road_corridors ADD COLUMN duration_confirmed_at TEXT")
+    connection.execute(
+        "UPDATE road_corridors SET duration_unit='minutes_legacy_unknown' "
+        "WHERE duration_unit IS NULL OR duration_unit=''"
+    )
+    deployment_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(deployments)").fetchall()
+    }
+    if deployment_columns and "expected_arrival_at" not in deployment_columns:
+        # 存量部署记录的预计到达时刻可能按错误单位算出：留空，历史读取不得替它补算。
+        connection.execute("ALTER TABLE deployments ADD COLUMN expected_arrival_at TEXT")
 
 
 @contextmanager

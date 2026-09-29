@@ -5,13 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import SystemClock, arrival_after_minutes, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    RiskIndexRecord,
+    ResponseCenter,
+    PreservationResourceLot,
+    DispatchRequest,
+    RoadCorridor,
+    ResponseScenario,
+    response_minutes_value,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -36,6 +43,22 @@ ROLE_PERMISSIONS = {
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
+
+# 路线响应时长全平台唯一业务口径：分钟。
+DURATION_UNIT_MINUTES = "minutes"
+# 存量数据无法证明单位：只能展示为待人工确认，禁止自动参与调度。
+DURATION_UNIT_LEGACY_UNKNOWN = "minutes_legacy_unknown"
+
+
+def route_view(row: sqlite3.Row) -> dict[str, Any]:
+    """路线读取的统一解释：显式携带时长单位与确认状态。"""
+    data = dict(row)
+    unit = row["duration_unit"]
+    data["duration_unit"] = unit
+    data["response_minutes_unit"] = DURATION_UNIT_MINUTES
+    data["duration_confirmed"] = unit == DURATION_UNIT_MINUTES
+    data["duration_pending_confirmation"] = unit == DURATION_UNIT_LEGACY_UNKNOWN
+    return data
 
 
 class CollectionLogisticsService:
@@ -204,7 +227,7 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO road_corridors(corridor_id,origin_center_id,destination_center_id,preservation_resource_kind,hourly_capacity,"
-                    "delay_basis_points,response_minutes,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "delay_basis_points,response_minutes,duration_unit,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         route.corridor_id,
                         route.origin_center_id,
@@ -213,10 +236,17 @@ class CollectionLogisticsService:
                         decimal_text(route.hourly_capacity),
                         route.delay_basis_points,
                         route.response_minutes,
+                        DURATION_UNIT_MINUTES,
                         self._now(),
                     ),
                 )
-                self._audit("route", route.corridor_id, "route.created", actor_id, raw)
+                self._audit(
+                    "route",
+                    route.corridor_id,
+                    "route.created",
+                    actor_id,
+                    {**dict(raw), "response_minutes_unit": DURATION_UNIT_MINUTES},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("转运路线编号冲突或设施不存在") from exc
         return self.route(route.corridor_id)
@@ -225,7 +255,48 @@ class CollectionLogisticsService:
         row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if row is None:
             raise NotFound("转运路线不存在")
-        return dict(row)
+        return route_view(row)
+
+    def _require_confirmed_duration(self, route: sqlite3.Row) -> None:
+        """无法证明单位的旧路线不得自动参与调度。"""
+        if route["duration_unit"] != DURATION_UNIT_MINUTES:
+            raise InvalidState(
+                f"转运路线 {route['corridor_id']} 的响应时长单位无法从历史数据证明，"
+                "已标记为待人工确认，确认前不得调度"
+            )
+
+    def confirm_route_duration(
+        self,
+        actor_id: str,
+        corridor_id: str,
+        response_minutes: int | None = None,
+    ) -> dict[str, Any]:
+        """人工确认存量路线的时长确实以分钟登记，也可同时纠正为正确分钟数。"""
+        self._require(actor_id, "catalog.write")
+        row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
+        if row is None:
+            raise NotFound("转运路线不存在")
+        if row["duration_unit"] == DURATION_UNIT_MINUTES:
+            raise Conflict("该路线时长单位已是分钟口径，无需人工确认")
+        # 无论沿用旧值还是人工纠正，都重新执行登记口径，非法值不得放行。
+        minutes = response_minutes_value(
+            row["response_minutes"] if response_minutes is None else response_minutes
+        )
+        confirmed_at = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "UPDATE road_corridors SET duration_unit=?,response_minutes=?,"
+                "duration_confirmed_by=?,duration_confirmed_at=?,revision=revision+1 WHERE corridor_id=?",
+                (DURATION_UNIT_MINUTES, minutes, actor_id, confirmed_at, corridor_id),
+            )
+            self._audit(
+                "route",
+                corridor_id,
+                "route.duration_confirmed",
+                actor_id,
+                {"response_minutes": minutes, "response_minutes_unit": DURATION_UNIT_MINUTES},
+            )
+        return self.route(corridor_id)
 
     def announce_restriction(
         self,
@@ -309,7 +380,13 @@ class CollectionLogisticsService:
             if stored["request_sha256"] != request_digest:
                 raise Conflict("幂等键对应不同调度申请内容")
             return json.loads(stored["response_json"])
-        route = self.route(dispatch_request.corridor_id)
+        route = self.connection.execute(
+            "SELECT * FROM road_corridors WHERE corridor_id=?",
+            (dispatch_request.corridor_id,),
+        ).fetchone()
+        if route is None:
+            raise NotFound("转运路线不存在")
+        self._require_confirmed_duration(route)
         if route["state"] != "active":
             raise InvalidState("转运路线当前不可调度申请")
         response = {
@@ -361,6 +438,7 @@ class CollectionLogisticsService:
         route = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if route is None:
             raise NotFound("转运路线不存在")
+        self._require_confirmed_duration(route)
         dispatch_requests = self.connection.execute(
             "SELECT * FROM dispatch_requests WHERE corridor_id=? AND duty_date=? AND state='submitted' "
             "ORDER BY priority,submitted_at,dispatch_id",
@@ -414,12 +492,13 @@ class CollectionLogisticsService:
     ) -> dict[str, Any]:
         self._require(actor_id, "deployment.write")
         dispatch_request = self.connection.execute(
-            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id FROM dispatch_requests n "
+            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.duration_unit,r.origin_center_id FROM dispatch_requests n "
             "JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
             (dispatch_id,),
         ).fetchone()
         if dispatch_request is None:
             raise NotFound("调度申请不存在")
+        self._require_confirmed_duration(dispatch_request)
         if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
             raise InvalidState("调度申请不是当前可资源到场版本")
         lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
@@ -432,7 +511,10 @@ class CollectionLogisticsService:
         if available < allocated:
             raise Conflict("应急资源库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
-        departed_at = self._now()
+        departed = self.clock.now()
+        departed_at = utc_text(departed)
+        response_minutes = int(dispatch_request["response_minutes"])
+        expected_arrival = utc_text(arrival_after_minutes(departed, response_minutes))
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
@@ -444,7 +526,7 @@ class CollectionLogisticsService:
             )
             self.connection.execute(
                 "INSERT INTO deployments(deployment_id,dispatch_id,inventory_preservation_resource_lot_id,deployed_units,"
-                "expected_arrived_units,departed_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                "expected_arrived_units,departed_at,expected_arrival_at,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     deployment_id,
                     dispatch_id,
@@ -452,17 +534,33 @@ class CollectionLogisticsService:
                     decimal_text(allocated),
                     decimal_text(expected_delivery),
                     departed_at,
+                    expected_arrival,
                     actor_id,
                     departed_at,
                 ),
             )
-            self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {"dispatch_id": dispatch_id})
+            self._audit(
+                "deployment",
+                deployment_id,
+                "deployment.dispatched",
+                actor_id,
+                {
+                    "dispatch_id": dispatch_id,
+                    "response_minutes": response_minutes,
+                    "response_minutes_unit": DURATION_UNIT_MINUTES,
+                    "departed_at": departed_at,
+                    "expected_arrival": expected_arrival,
+                },
+            )
         return {
             "deployment_id": deployment_id,
             "state": "in_transit",
             "deployed_units": decimal_text(allocated),
             "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
+            "departed_at": departed_at,
+            "response_minutes": response_minutes,
+            "response_minutes_unit": DURATION_UNIT_MINUTES,
+            "expected_arrival": expected_arrival,
         }
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -520,7 +618,7 @@ class CollectionLogisticsService:
             "scenario_sha256": row["content_sha256"],
             "as_of_date": as_of_date,
             "index": index_row["index_value"],
-            "road_corridors": [dict(item) for item in road_corridors],
+            "road_corridors": [route_view(item) for item in road_corridors],
             "inventory": [dict(item) for item in inventory],
         }
         input_sha256 = digest(input_value)
@@ -569,3 +667,52 @@ class CollectionLogisticsService:
                 break
             previous_hash = row["event_hash"]
         return {"valid": valid, "events": len(rows), "head_hash": previous_hash}
+
+    def audit_summary(self, actor_id: str) -> dict[str, Any]:
+        """审计摘要：事件计数，以及时长口径相关事件的显式单位清单。"""
+        self._require(actor_id, "audit.read")
+        rows = self.connection.execute(
+            "SELECT event_type, payload_json FROM traffic_audit_events ORDER BY event_id"
+        ).fetchall()
+        counts: dict[str, int] = {}
+        duration_events: list[dict[str, Any]] = []
+        for row in rows:
+            counts[row["event_type"]] = counts.get(row["event_type"], 0) + 1
+            payload = json.loads(row["payload_json"])
+            if "response_minutes" in payload:
+                # 与路线接口、任务执行结果使用同一解释：分钟。
+                duration_events.append(
+                    {
+                        "event_type": row["event_type"],
+                        "response_minutes": payload["response_minutes"],
+                        "response_minutes_unit": payload.get(
+                            "response_minutes_unit", DURATION_UNIT_LEGACY_UNKNOWN
+                        ),
+                    }
+                )
+        return {
+            "events": len(rows),
+            "counts": dict(sorted(counts.items())),
+            "duration_unit": DURATION_UNIT_MINUTES,
+            "duration_events": duration_events,
+        }
+
+    def deployment(self, deployment_id: str) -> dict[str, Any]:
+        """历史读取：部署记录与路线时长口径必须使用同一解释。"""
+        row = self.connection.execute(
+            "SELECT d.*,r.response_minutes,r.duration_unit FROM deployments d "
+            "JOIN dispatch_requests n ON n.dispatch_id=d.dispatch_id "
+            "JOIN road_corridors r ON r.corridor_id=n.corridor_id "
+            "WHERE d.deployment_id=?",
+            (deployment_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("任务执行记录不存在")
+        data = dict(row)
+        unit = row["duration_unit"]
+        data["response_minutes_unit"] = DURATION_UNIT_MINUTES
+        data["duration_confirmed"] = unit == DURATION_UNIT_MINUTES
+        data["duration_pending_confirmation"] = unit == DURATION_UNIT_LEGACY_UNKNOWN
+        # 预计到达时刻以发车时落库的值为准；存量记录留空，历史读取不得按当前路线值补算。
+        data["expected_arrival"] = row["expected_arrival_at"]
+        return data

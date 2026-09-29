@@ -38,3 +38,18 @@ def parse_utc(value: str, field: str = "时间") -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"{field} 必须包含时区")
     return parsed.astimezone(timezone.utc)
+
+
+def arrival_after_minutes(departed_at: datetime, response_minutes: int) -> datetime:
+    """从带时区的实际出发时刻增加分钟，得到预计到达时刻。
+
+    先归一到 UTC 再加分钟：救援时长是物理经过时间，必须按绝对时刻运算。
+    若直接在本地墙上时间上加，夏令时回拨当天会多算一小时、拨快当天会少算。
+    归一后跨日自然进位，夏令时切换结果唯一确定。
+    入参分钟由 models.response_minutes_value 保证为正整数，这里做防御性校验。
+    """
+    if departed_at.tzinfo is None or departed_at.utcoffset() is None:
+        raise ValueError("出发时刻必须带时区")
+    if isinstance(response_minutes, bool) or not isinstance(response_minutes, int) or response_minutes <= 0:
+        raise ValueError("响应时长必须是正整数分钟")
+    return departed_at.astimezone(timezone.utc) + timedelta(minutes=response_minutes)

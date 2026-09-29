@@ -47,3 +47,11 @@ PYTHONPATH=src python3 -m biosafety_ops.api --database safety.sqlite3 --host 127
 ~~~
 
 服务提供浏览器无关的 JSON 接口和健康检查。进程重启后可以继续读取 SQLite 中的业务状态与审计历史。
+
+## 巡护路线响应时长口径
+
+- 路线的 `response_minutes` 在登记、调度、审计与历史读取各层统一表示**整数分钟**；写入前会拒绝零值、负值、非整数和超过 7 天（10080 分钟）的超长值。
+- 预计到达时刻由带时区的实际出发时刻先归一到 UTC 再增加分钟计算（`clock.arrival_after_minutes`），跨日自动进位，夏令时拨快/回拨结果均唯一确定。
+- 升级前已存在的路线无法从数据中证明单位，启动迁移时会自动标为 `duration_unit = minutes_legacy_unknown`，路线接口返回 `duration_pending_confirmation: true`，且调度申请、运力分配和资源发车都会被拒绝。
+- 旧部署记录的预计到达时刻在迁移后置空，历史读取（`GET /deployments/history/{id}`）不会按当前路线值补算。
+- 人工核对（必要时纠正分钟数）后调用 `POST /road_corridors/{id}/confirm_duration`（planner 角色，body 可带 `response_minutes`）解除待确认状态；操作记入审计链。审计摘要见 `GET /audit/summary`，其中时长事件一律显式携带 `response_minutes_unit: "minutes"`。

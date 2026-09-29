@@ -67,6 +67,9 @@ class JsonApplication:
                 return Response(201, self.service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "outages":
                 return Response(201, self.service.announce_restriction(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "confirm_duration":
+                # 原始 JSON 值交给领域层做分钟口径校验，避免 int() 静默截断小数。
+                return Response(200, self.service.confirm_route_duration(actor, parts[1], payload.get("response_minutes")))
             if method == "POST" and path == "/inventory/lots":
                 return Response(201, self.service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":
@@ -77,6 +80,8 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["duty_date"]))
             if method == "POST" and path == "/deployments":
                 return Response(201, self.service.dispatch_deployment(actor, payload["deployment_id"], payload["dispatch_id"], payload["preservation_resource_lot_id"], int(payload["expected_revision"])))
+            if method == "GET" and len(parts) == 3 and parts[:2] == ["deployments", "history"]:
+                return Response(200, self.service.deployment(parts[2]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
@@ -85,6 +90,8 @@ class JsonApplication:
                 return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
                 return Response(200, self.service.audit_chain(actor))
+            if method == "GET" and path == "/audit/summary":
+                return Response(200, self.service.audit_summary(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except CollectionDispatchError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

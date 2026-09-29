@@ -17,6 +17,20 @@ RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUST
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
 
+# 路线响应时长的业务含义统一为分钟；超过 7 天视为登记错误，拒绝写入。
+MAX_RESPONSE_MINUTES = 7 * 24 * 60
+
+
+def response_minutes_value(value: object, field: str = "response_minutes") -> int:
+    """登记口径：分钟，必须是 1 到 MAX_RESPONSE_MINUTES 的整数。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationFailed(f"{field} 必须是整数分钟")
+    if value <= 0:
+        raise ValidationFailed(f"{field} 必须大于零分钟")
+    if value > MAX_RESPONSE_MINUTES:
+        raise ValidationFailed(f"{field} 不能超过 {MAX_RESPONSE_MINUTES} 分钟")
+    return value
+
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -54,12 +68,6 @@ def decimal_value(
     if maximum is not None and result > maximum:
         raise ValidationFailed(f"{field} 不能大于 {maximum}")
     return result
-
-
-def positive_integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationFailed(f"{field} 必须是正整数")
-    return value
 
 
 def date_text(value: object, field: str) -> str:
@@ -155,7 +163,7 @@ class RoadCorridor:
                 raw.get("hourly_capacity"), "hourly_capacity", minimum=Decimal("0.001")
             ),
             delay_basis_points=loss,
-            response_minutes=positive_integer(raw.get("response_minutes"), "response_minutes"),
+            response_minutes=response_minutes_value(raw.get("response_minutes")),
         )
 
 
