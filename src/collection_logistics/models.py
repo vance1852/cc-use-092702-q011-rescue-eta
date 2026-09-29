@@ -17,6 +17,10 @@ RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUST
 RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
 
+# 全平台统一口径：路线/救援通行时长一律以分钟为单位。
+# 任何超过 72 小时（4320 分钟）的山地路线时长都视为不合理的超长值（例如分钟被误写成小时）。
+DURATION_MINUTES_MAXIMUM = 4320
+
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -56,9 +60,14 @@ def decimal_value(
     return result
 
 
-def positive_integer(value: object, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValidationFailed(f"{field} 必须是正整数")
+def duration_minutes(value: object, field: str = "duration_minutes") -> int:
+    """统一的通行时长校验：分钟整数，排除零值、负值和不合理的超长值。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationFailed(f"{field} 必须是以分钟为单位的整数")
+    if value <= 0:
+        raise ValidationFailed(f"{field} 必须大于零")
+    if value > DURATION_MINUTES_MAXIMUM:
+        raise ValidationFailed(f"{field} 不能超过 {DURATION_MINUTES_MAXIMUM} 分钟（72 小时），请确认单位为分钟")
     return value
 
 
@@ -132,7 +141,7 @@ class RoadCorridor:
     preservation_resource_kind: str
     hourly_capacity: Decimal
     delay_basis_points: int
-    response_minutes: int
+    duration_minutes: int
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RoadCorridor":
@@ -155,7 +164,7 @@ class RoadCorridor:
                 raw.get("hourly_capacity"), "hourly_capacity", minimum=Decimal("0.001")
             ),
             delay_basis_points=loss,
-            response_minutes=positive_integer(raw.get("response_minutes"), "response_minutes"),
+            duration_minutes=duration_minutes(raw.get("duration_minutes")),
         )
 
 

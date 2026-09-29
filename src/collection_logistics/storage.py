@@ -52,11 +52,22 @@ CREATE TABLE IF NOT EXISTS road_corridors (
     preservation_resource_kind TEXT NOT NULL,
     hourly_capacity TEXT NOT NULL,
     delay_basis_points INTEGER NOT NULL,
-    response_minutes INTEGER NOT NULL,
+    duration_minutes INTEGER,
+    legacy_duration_value INTEGER,
+    duration_unit TEXT NOT NULL DEFAULT 'minute'
+        CHECK(duration_unit IN ('minute','unknown')),
+    review_status TEXT NOT NULL DEFAULT 'confirmed'
+        CHECK(review_status IN ('confirmed','pending_review')),
     revision INTEGER NOT NULL DEFAULT 1,
     state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
     created_at TEXT NOT NULL,
-    CHECK(origin_center_id <> destination_center_id)
+    CHECK(origin_center_id <> destination_center_id),
+    CHECK(duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes <= 4320)),
+    CHECK(
+        (duration_unit = 'minute' AND review_status = 'confirmed' AND duration_minutes IS NOT NULL)
+        OR
+        (duration_unit = 'unknown' AND review_status = 'pending_review' AND duration_minutes IS NULL)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS corridor_restrictions (
@@ -209,6 +220,69 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate_legacy_duration(connection)
+
+
+def _migrate_legacy_duration(connection: sqlite3.Connection) -> None:
+    """把以 response_minutes 存储、无法证明单位的旧路线标为待人工确认。
+
+    旧值原样保留在 legacy_duration_value 中，duration_minutes 置空，调度链路
+    因此无法再自动使用这些行；人工确认提供正确的分钟值后才会重新参与调度。
+    """
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(road_corridors)")}
+    if not columns or "response_minutes" not in columns:
+        return
+    migrated_ddl = """
+        CREATE TABLE road_corridors_migrated (
+            corridor_id TEXT PRIMARY KEY,
+            origin_center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+            destination_center_id TEXT NOT NULL REFERENCES response_centers(center_id),
+            preservation_resource_kind TEXT NOT NULL,
+            hourly_capacity TEXT NOT NULL,
+            delay_basis_points INTEGER NOT NULL,
+            duration_minutes INTEGER,
+            legacy_duration_value INTEGER,
+            duration_unit TEXT NOT NULL DEFAULT 'minute'
+                CHECK(duration_unit IN ('minute','unknown')),
+            review_status TEXT NOT NULL DEFAULT 'confirmed'
+                CHECK(review_status IN ('confirmed','pending_review')),
+            revision INTEGER NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','suspended','retired')),
+            created_at TEXT NOT NULL,
+            CHECK(origin_center_id <> destination_center_id),
+            CHECK(duration_minutes IS NULL OR (duration_minutes > 0 AND duration_minutes <= 4320)),
+            CHECK(
+                (duration_unit = 'minute' AND review_status = 'confirmed' AND duration_minutes IS NOT NULL)
+                OR
+                (duration_unit = 'unknown' AND review_status = 'pending_review' AND duration_minutes IS NULL)
+            )
+        );
+    """
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            migrated_ddl
+            + """
+        INSERT INTO road_corridors_migrated(
+            corridor_id,origin_center_id,destination_center_id,preservation_resource_kind,hourly_capacity,
+            delay_basis_points,duration_minutes,legacy_duration_value,duration_unit,review_status,
+            revision,state,created_at
+        )
+        SELECT corridor_id,origin_center_id,destination_center_id,preservation_resource_kind,hourly_capacity,
+               delay_basis_points,NULL,response_minutes,'unknown','pending_review',
+               revision,state,created_at
+        FROM road_corridors;
+
+        DROP TABLE road_corridors;
+
+        ALTER TABLE road_corridors_migrated RENAME TO road_corridors;
+        """
+        )
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
+        # 改名后让外键约束重新指向现存的 road_corridors 表。
+        connection.execute("PRAGMA foreign_key_check")
 
 
 @contextmanager

@@ -5,13 +5,20 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import SystemClock, arrival_after_minutes, parse_utc, utc_text
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import RiskIndexRecord, ResponseCenter, PreservationResourceLot, DispatchRequest, RoadCorridor, ResponseScenario
+from .models import (
+    RiskIndexRecord,
+    ResponseCenter,
+    PreservationResourceLot,
+    DispatchRequest,
+    RoadCorridor,
+    ResponseScenario,
+    duration_minutes as validate_duration_minutes,
+)
 from .planning import (
     AllocationRequest,
     RiskPoint,
@@ -204,7 +211,8 @@ class CollectionLogisticsService:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
                     "INSERT INTO road_corridors(corridor_id,origin_center_id,destination_center_id,preservation_resource_kind,hourly_capacity,"
-                    "delay_basis_points,response_minutes,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "delay_basis_points,duration_minutes,legacy_duration_value,duration_unit,review_status,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         route.corridor_id,
                         route.origin_center_id,
@@ -212,11 +220,17 @@ class CollectionLogisticsService:
                         route.preservation_resource_kind,
                         decimal_text(route.hourly_capacity),
                         route.delay_basis_points,
-                        route.response_minutes,
+                        route.duration_minutes,
+                        None,
+                        "minute",
+                        "confirmed",
                         self._now(),
                     ),
                 )
-                self._audit("route", route.corridor_id, "route.created", actor_id, raw)
+                self._audit("route", route.corridor_id, "route.created", actor_id, {
+                    "duration_minutes": route.duration_minutes,
+                    "duration_unit": "minute",
+                })
         except sqlite3.IntegrityError as exc:
             raise Conflict("转运路线编号冲突或设施不存在") from exc
         return self.route(route.corridor_id)
@@ -225,7 +239,61 @@ class CollectionLogisticsService:
         row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
         if row is None:
             raise NotFound("转运路线不存在")
-        return dict(row)
+        return self._route_view(row)
+
+    @staticmethod
+    def _route_view(row: sqlite3.Row) -> dict[str, Any]:
+        """路线接口与历史读取的统一解释：时长一律以分钟呈现。"""
+        view = dict(row)
+        view["duration_minutes"] = row["duration_minutes"]
+        view["duration_unit"] = row["duration_unit"]
+        view["review_status"] = row["review_status"]
+        view["duration_pending_review"] = row["review_status"] == "pending_review"
+        return view
+
+    def _route_for_scheduling(self, corridor_id: str) -> sqlite3.Row:
+        """取参与调度的路线；单位无法证明的旧数据必须先经人工确认。"""
+        row = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
+        if row is None:
+            raise NotFound("转运路线不存在")
+        if row["review_status"] == "pending_review" or row["duration_unit"] != "minute" or row["duration_minutes"] is None:
+            raise InvalidState("路线通行时长单位待人工确认，暂不能自动参与调度")
+        return row
+
+    def confirm_route_duration(self, actor_id: str, corridor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """人工确认旧路线的真实通行时长（分钟），确认后恢复调度。"""
+        self._require(actor_id, "catalog.write")
+        existing = self.connection.execute(
+            "SELECT legacy_duration_value FROM road_corridors WHERE corridor_id=?",
+            (corridor_id,),
+        ).fetchone()
+        if existing is None:
+            raise NotFound("转运路线不存在")
+        minutes = validate_duration_minutes(raw.get("duration_minutes"), "duration_minutes")
+        note = str(raw.get("note", "")).strip()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE road_corridors SET duration_minutes=?,duration_unit='minute',review_status='confirmed',"
+                "revision=revision+1 WHERE corridor_id=? AND review_status='pending_review'",
+                (minutes, corridor_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("路线时长已经确认，无需重复确认")
+            self._audit("route", corridor_id, "route.duration_confirmed", actor_id, {
+                "duration_minutes": minutes,
+                "duration_unit": "minute",
+                "legacy_duration_value": existing["legacy_duration_value"],
+                "note": note,
+            })
+        return self.route(corridor_id)
+
+    def routes_pending_review(self, actor_id: str) -> dict[str, Any]:
+        # 所有在岗角色都需要看到待确认警示，避免接班人员在不知情下继续调度。
+        self._user(actor_id)
+        rows = self.connection.execute(
+            "SELECT * FROM road_corridors WHERE review_status='pending_review' ORDER BY corridor_id"
+        ).fetchall()
+        return {"routes": [self._route_view(row) for row in rows], "count": len(rows)}
 
     def announce_restriction(
         self,
@@ -309,7 +377,7 @@ class CollectionLogisticsService:
             if stored["request_sha256"] != request_digest:
                 raise Conflict("幂等键对应不同调度申请内容")
             return json.loads(stored["response_json"])
-        route = self.route(dispatch_request.corridor_id)
+        route = self._route_for_scheduling(dispatch_request.corridor_id)
         if route["state"] != "active":
             raise InvalidState("转运路线当前不可调度申请")
         response = {
@@ -358,9 +426,7 @@ class CollectionLogisticsService:
 
     def allocate(self, actor_id: str, corridor_id: str, duty_date: str) -> dict[str, Any]:
         self._require(actor_id, "allocation.run")
-        route = self.connection.execute("SELECT * FROM road_corridors WHERE corridor_id=?", (corridor_id,)).fetchone()
-        if route is None:
-            raise NotFound("转运路线不存在")
+        route = self._route_for_scheduling(corridor_id)
         dispatch_requests = self.connection.execute(
             "SELECT * FROM dispatch_requests WHERE corridor_id=? AND duty_date=? AND state='submitted' "
             "ORDER BY priority,submitted_at,dispatch_id",
@@ -414,12 +480,19 @@ class CollectionLogisticsService:
     ) -> dict[str, Any]:
         self._require(actor_id, "deployment.write")
         dispatch_request = self.connection.execute(
-            "SELECT n.*,r.delay_basis_points,r.response_minutes,r.origin_center_id FROM dispatch_requests n "
+            "SELECT n.*,r.delay_basis_points,r.duration_minutes,r.origin_center_id,r.duration_unit,r.review_status "
+            "FROM dispatch_requests n "
             "JOIN road_corridors r ON r.corridor_id=n.corridor_id WHERE n.dispatch_id=?",
             (dispatch_id,),
         ).fetchone()
         if dispatch_request is None:
             raise NotFound("调度申请不存在")
+        if (
+            dispatch_request["review_status"] == "pending_review"
+            or dispatch_request["duration_unit"] != "minute"
+            or dispatch_request["duration_minutes"] is None
+        ):
+            raise InvalidState("路线通行时长单位待人工确认，暂不能自动执行部署")
         if dispatch_request["state"] != "allocated" or dispatch_request["revision"] != expected_revision:
             raise InvalidState("调度申请不是当前可资源到场版本")
         lot = self.connection.execute("SELECT * FROM preservation_resource_lots WHERE preservation_resource_lot_id=?", (preservation_resource_lot_id,)).fetchone()
@@ -433,6 +506,9 @@ class CollectionLogisticsService:
             raise Conflict("应急资源库存不足以完成分配")
         expected_delivery = delivered_after_loss(allocated, int(dispatch_request["delay_basis_points"]))
         departed_at = self._now()
+        departed_dt = parse_utc(departed_at)
+        duration = int(dispatch_request["duration_minutes"])
+        expected_arrival = arrival_after_minutes(departed_dt, duration)
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE preservation_resource_lots SET available_units=?,revision=revision+1 WHERE preservation_resource_lot_id=? AND revision=?",
@@ -456,13 +532,21 @@ class CollectionLogisticsService:
                     departed_at,
                 ),
             )
-            self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {"dispatch_id": dispatch_id})
+            self._audit("deployment", deployment_id, "deployment.dispatched", actor_id, {
+                "dispatch_id": dispatch_id,
+                "duration_minutes": duration,
+                "duration_unit": "minute",
+                "expected_arrival": utc_text(expected_arrival),
+            })
         return {
             "deployment_id": deployment_id,
             "state": "in_transit",
             "deployed_units": decimal_text(allocated),
             "expected_arrived_units": decimal_text(expected_delivery),
-            "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(dispatch_request["response_minutes"]))),
+            "duration_minutes": duration,
+            "duration_unit": "minute",
+            "departed_at": utc_text(departed_dt),
+            "expected_arrival": utc_text(expected_arrival),
         }
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -511,7 +595,10 @@ class CollectionLogisticsService:
         ).fetchone()
         if index_row is None:
             raise InvalidState("截止日期没有可用风险指数")
-        road_corridors = self.connection.execute("SELECT * FROM road_corridors WHERE state='active' ORDER BY corridor_id").fetchall()
+        road_corridors = self.connection.execute(
+            "SELECT * FROM road_corridors WHERE state='active' "
+            "AND review_status='confirmed' AND duration_unit='minute' ORDER BY corridor_id"
+        ).fetchall()
         inventory = self.connection.execute(
             "SELECT center_id,preservation_resource_kind,sum(CAST(available_units AS REAL)) available_units "
             "FROM preservation_resource_lots GROUP BY center_id,preservation_resource_kind ORDER BY center_id,preservation_resource_kind"

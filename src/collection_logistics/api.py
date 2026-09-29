@@ -65,6 +65,10 @@ class JsonApplication:
                 return Response(201, self.service.create_facility(actor, payload))
             if method == "POST" and path == "/road_corridors":
                 return Response(201, self.service.create_route(actor, payload))
+            if method == "GET" and path == "/road_corridors/pending_review":
+                return Response(200, self.service.routes_pending_review(actor))
+            if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "confirm_duration":
+                return Response(200, self.service.confirm_route_duration(actor, parts[1], payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "outages":
                 return Response(201, self.service.announce_restriction(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
